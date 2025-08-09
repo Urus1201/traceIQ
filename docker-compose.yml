@@ -5,7 +5,9 @@ services:
     build: ./viewer-backend
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
     volumes:
-      - ./viewer-backend:/app
+  - ./viewer-backend:/app
+  # Local SEG-Y samples live in ./data on host; available as /data in container
+  - ./data:/data:ro
     ports:
       - "8000:8000"
     environment:

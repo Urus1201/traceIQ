@@ -42,3 +42,11 @@ yarn-error.log*
 # Misc
 *.swp
 *.swo
+
+# Data samples (SEG-Y and other binaries)
+data/**
+!data/.gitkeep
+*.sgy
+*.segy
+*.SEG
+*.SU
