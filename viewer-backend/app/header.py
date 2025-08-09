@@ -5,6 +5,7 @@ from app.schemas import HeaderJSON
 from app.iq_parser import parse_header_iq
 from segy.binary_header import read_binary_header
 from qc.sanity import sanity_derive_from_text
+from qc.consistency import check_text_vs_binary
 from extract.value_extractors import (
     match_samples_per_trace,
     match_bytes_per_sample,
@@ -13,6 +14,9 @@ from extract.value_extractors import (
 )
 import tempfile
 import os
+import json
+from typing import Optional
+from fastapi import Body
 
 router = APIRouter()
 
@@ -60,11 +64,14 @@ async def header_iq(file: UploadFile = File(None), path: str = Form(None)) -> He
 
 
 @router.post("/header/read_binary")
-async def read_binary(path: str = Form(...)):
+async def read_binary(payload: dict = Body(...)):
     """Read minimal binary header fields using segyio if available.
     Body: { path: "..." }
     Returns: { sample_interval_us, samples_per_trace, format_code }
     """
+    path = payload.get("path")
+    if not path:
+        return JSONResponse(status_code=400, content={"error": "Missing 'path'"})
     stub = read_binary_header(path)
     return {
         "sample_interval_us": stub.sample_interval_us,
@@ -83,7 +90,7 @@ async def preview_text(path: str = Query(...)):
 
 
 @router.post("/header/sanity")
-async def header_sanity(path: str = Form(...)):
+async def header_sanity(payload: dict = Body(...)):
     """Return a small set of derived fields as FieldEvidence-like dicts.
     No full parsing; proves the utility functions end-to-end.
     Expected fields (when present):
@@ -93,6 +100,9 @@ async def header_sanity(path: str = Form(...)):
     - data_traces_per_record (from L5)
     - aux_traces_per_record (from L5)
     """
+    path = payload.get("path")
+    if not path:
+        return JSONResponse(status_code=400, content={"error": "Missing 'path'"})
     hdr = read_text_header(path)
     lines = hdr["lines"]
     out = {}
@@ -141,3 +151,106 @@ async def header_sanity(path: str = Form(...)):
             }
 
     return out
+
+
+def _peek_first_trace_samples(path: str) -> Optional[int]:
+    """Best-effort peek of the first trace length using segyio; returns None if unavailable.
+    Keeps IO minimal by aborting after the first trace.
+    """
+    try:
+        import segyio  # type: ignore
+
+        with segyio.open(path, mode="r", strict=False, ignore_geometry=True) as f:  # type: ignore[attr-defined]
+            try:
+                tr0 = f.trace[0]
+                return int(len(tr0))
+            except Exception:
+                return None
+    except Exception:
+        return None
+
+
+@router.post("/header/apply_patch")
+async def apply_patch(payload: dict = Body(...)):
+    """Create a sidecar JSON aligning textual header fields with binary header.
+
+    Payload: { path: str }
+    Writes: <path>.header.sidecar.json with structure:
+      - original_text: header sanity dictionary (subset)
+      - corrected: fields aligned to binary
+      - issues: list from check_text_vs_binary
+      - source for corrected fields: "binary"
+      - binary_peek: optional validation of samples_per_trace from first trace
+    """
+    path = payload.get("path")
+    if not path:
+        return JSONResponse(status_code=400, content={"error": "Missing 'path'"})
+
+    # Gather text-derived sanity and binary header
+    hdr = read_text_header(path)
+    lines = hdr["lines"]
+    text_sanity = {}
+
+    # reuse the logic in header_sanity (L5/L6 expectations)
+    if len(lines) >= 6:
+        l6 = lines[5]
+        s = match_samples_per_trace(l6)
+        b = match_bytes_per_sample(l6)
+        if b:
+            text_sanity["sample_interval_ms"] = {
+                "value": b[0],
+                "confidence": 0.9,
+                "line_refs": [6],
+                "raw_spans": [b[1]],
+            }
+        if s:
+            text_sanity["samples_per_trace"] = {
+                "value": s[0],
+                "confidence": 0.9,
+                "line_refs": [6],
+                "raw_spans": [s[1]],
+            }
+
+    text_sanity.update(sanity_derive_from_text(lines))
+
+    bin_stub = read_binary_header(path)
+    bin_dict = {
+        "sample_interval_us": bin_stub.sample_interval_us,
+        "samples_per_trace": bin_stub.samples_per_trace,
+        "format_code": bin_stub.format_code,
+    }
+
+    # Consistency check and patch proposal
+    result = check_text_vs_binary(text_sanity, bin_dict)
+
+    corrected = {}
+    for item in result.get("suggested_patch", []):
+        corrected[item["field"]] = {
+            "value": item["new_value"],
+            "source": "binary",
+            "rationale": item.get("rationale"),
+        }
+
+    # Optional binary peek validator
+    peek_samples = _peek_first_trace_samples(path)
+    binary_peek = {
+        "first_trace_samples": peek_samples,
+        "validated": (peek_samples is not None and corrected.get("samples_per_trace", {}).get("value") == peek_samples),
+    }
+
+    sidecar = {
+        "original_text": text_sanity,
+        "corrected": corrected,
+        "issues": result.get("issues", []),
+        "binary": bin_dict,
+        "binary_peek": binary_peek,
+    }
+
+    sidecar_path = f"{path}.header.sidecar.json"
+    try:
+        with open(sidecar_path, "w", encoding="utf-8") as f:
+            json.dump(sidecar, f, indent=2)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": f"Failed to write sidecar: {e}"})
+
+    return {"written": sidecar_path, **sidecar}

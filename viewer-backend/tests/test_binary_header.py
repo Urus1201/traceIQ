@@ -8,7 +8,7 @@ def test_read_binary_header_fallback(tmp_path):
     p.write_bytes(b"not a segy file")
 
     client = TestClient(app)
-    resp = client.post("/header/read_binary", data={"path": str(p)})
+    resp = client.post("/header/read_binary", json={"path": str(p)})
     assert resp.status_code == 200
     data = resp.json()
 

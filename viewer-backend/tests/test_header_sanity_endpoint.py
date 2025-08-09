@@ -25,7 +25,7 @@ def test_header_sanity_endpoint(tmp_path):
     assert prev_json["lines"][5].startswith("C06  SAMPLES/TRACE")
 
     # Sanity endpoint should produce five fields with spans and line refs
-    resp = client.post("/header/sanity", data={"path": str(p)})
+    resp = client.post("/header/sanity", json={"path": str(p)})
     assert resp.status_code == 200
     data = resp.json()
 
