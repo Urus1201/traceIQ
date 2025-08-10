@@ -1,8 +1,10 @@
-from fastapi import APIRouter, UploadFile, File, Form, Query
+from fastapi import APIRouter, UploadFile, File, Form, Query, Depends, Request
 from fastapi.responses import JSONResponse
 from segy.header_io import read_text_header
-from app.schemas import HeaderJSON
+from app.schemas import HeaderJSON, ParseResponse, ProvenanceEntry
 from app.iq_parser import parse_header_iq
+from extract.baseline_parser import parse_baseline
+from extract.llm_fallback import run_llm, merge_with_confidence, LLMProvider
 from segy.binary_header import read_binary_header
 from qc.sanity import sanity_derive_from_text
 from qc.consistency import check_text_vs_binary
@@ -15,8 +17,9 @@ from extract.value_extractors import (
 import tempfile
 import os
 import json
-from typing import Optional
+from typing import Optional, List
 from fastapi import Body
+from pydantic import BaseModel, field_validator
 
 router = APIRouter()
 
@@ -247,10 +250,85 @@ async def apply_patch(payload: dict = Body(...)):
     }
 
     sidecar_path = f"{path}.header.sidecar.json"
+    note: Optional[str] = None
     try:
         with open(sidecar_path, "w", encoding="utf-8") as f:
             json.dump(sidecar, f, indent=2)
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": f"Failed to write sidecar: {e}"})
+        written_path = sidecar_path
+    except Exception:
+        # Read-only dir (e.g., /data). Fall back to SIDECAR_DIR or /app/sidecars
+        fallback_dir = os.environ.get("SIDECAR_DIR", "/app/sidecars")
+        try:
+            os.makedirs(fallback_dir, exist_ok=True)
+            fallback_path = os.path.join(
+                fallback_dir, os.path.basename(sidecar_path)
+            )
+            with open(fallback_path, "w", encoding="utf-8") as f:
+                json.dump(sidecar, f, indent=2)
+            written_path = fallback_path
+            note = f"Primary location not writable; wrote to {fallback_dir}"
+        except Exception as e2:
+            return JSONResponse(
+                status_code=500,
+                content={"error": f"Failed to write sidecar: {e2}"},
+            )
 
-    return {"written": sidecar_path, **sidecar}
+    resp = {"written": written_path, **sidecar}
+    if note:
+        resp["note"] = note
+    return resp
+
+
+class _NoopProvider:
+    def infer(self, prompt: str) -> dict:
+        # Default offline provider that returns empty result; tests will patch with a mock
+        return {"header": {}}
+
+
+class ParseRequest(BaseModel):
+    lines: List[str]
+    use_llm: bool = True
+
+    @field_validator("lines")
+    @classmethod
+    def _normalize_lines(cls, v: List[str]) -> List[str]:
+        if not isinstance(v, list) or len(v) == 0:
+            raise ValueError("'lines' must be a non-empty list of strings")
+        # Coerce to str, trim/pad to exactly 40 lines
+        v = [str(x) for x in v[:40]]
+        if len(v) < 40:
+            v += [""] * (40 - len(v))
+        return v
+
+def get_llm_provider(request: Request) -> LLMProvider:
+    # Allow apps/tests to inject a real provider via app.state.llm_provider
+    prov = getattr(request.app.state, "llm_provider", None)
+    return prov if prov is not None else _NoopProvider()
+
+
+@router.post("/header/parse", response_model=ParseResponse)
+async def parse_header(req: ParseRequest, provider: LLMProvider = Depends(get_llm_provider)) -> ParseResponse:
+    """Phase-3 parser: combine baseline regex with optional LLM fallback and return provenance.
+
+    Body schema:
+      {
+        "lines": ["C01 ...", ..., "C40 ..."],
+        "use_llm": true
+      }
+    """
+    lines = req.lines  # already normalized to exactly 40 via validator
+
+    # 1) Baseline
+    base = parse_baseline(lines)
+
+    # 2) LLM fallback (pluggable)
+    llm_fields = run_llm(lines, provider) if req.use_llm and provider else {}
+
+    # 3) Merge
+    merged_fields, prov = merge_with_confidence(base, llm_fields)
+
+    # 4) Project into HeaderJSON (filter to schema fields)
+    hj = HeaderJSON(**{k: fe for k, fe in merged_fields.items() if k in HeaderJSON.model_fields})
+
+    provenance = [ProvenanceEntry(**p) for p in prov]
+    return ParseResponse(header=hj, provenance=provenance)
