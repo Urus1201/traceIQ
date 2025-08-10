@@ -1,6 +1,5 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
-
-const App = () => <h1>Viewer UI is running</h1>;
+import App from './App';
 
 ReactDOM.createRoot(document.getElementById('root')!).render(<App />);

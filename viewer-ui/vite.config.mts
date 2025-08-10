@@ -6,5 +6,15 @@ export default defineConfig({
   server: {
     port: 5173,
     host: true,
+    proxy: {
+      '/header': {
+        target: 'http://localhost:8000',
+        changeOrigin: true,
+      },
+      '/health': {
+        target: 'http://localhost:8000',
+        changeOrigin: true,
+      },
+    },
   },
 });
