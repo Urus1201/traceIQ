@@ -46,7 +46,11 @@ def _clamp01(x: float) -> float:
 def run_llm(lines: List[str], provider: LLMProvider) -> Dict[str, FieldEvidence]:
     schema_json = HeaderJSON.model_json_schema()
     prompt = PROMPT_TEMPLATE.format(schema=schema_json, lines=_format_lines(lines))
-    raw = provider.infer(prompt)
+    try:
+        raw = provider.infer(prompt)
+    except Exception:
+        # If provider fails (network, auth, bad deployment), fall back silently
+        return {}
     out: Dict[str, FieldEvidence] = {}
 
     try:

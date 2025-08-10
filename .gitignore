@@ -43,6 +43,9 @@ yarn-error.log*
 *.swp
 *.swo
 
+# Local environment files (keep secrets out of git)
+.env.azure*
+
 # Data samples (SEG-Y and other binaries)
 data/**
 !data/.gitkeep

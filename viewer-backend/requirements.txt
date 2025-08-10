@@ -4,3 +4,4 @@ psycopg2-binary
 redis
 python-multipart
 segyio
+openai

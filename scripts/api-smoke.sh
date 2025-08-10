@@ -47,6 +47,18 @@ for f in "${files[@]}"; do
     jq -c 'to_entries|map(select(.value != null))|map({k: .key, v: (if (.value|type)=="object" then .value.value else .value end)})' /tmp/iq.json || true
   fi
 
+  # header/parse using lines from /header/read (baseline only; set use_llm=true to enable LLM fallback if configured)
+  if [[ -s /tmp/read.json ]]; then
+    jq -c '{lines: .lines, use_llm: true}' /tmp/read.json > /tmp/parse_body.json || true
+    curl -s -X POST "$BACKEND_URL/header/parse" \
+      -H "Content-Type: application/json" \
+      -d @/tmp/parse_body.json \
+      -o /tmp/parse.json -w "code=%{http_code}\n" | sed 's/.*/parse-> &/'
+    if [[ -s /tmp/parse.json ]]; then
+      jq -c '{header_non_null: (.header|to_entries|map(select(.value != null))|map(.key)), provenance_count: (.provenance|length)}' /tmp/parse.json || true
+    fi
+  fi
+
   count=$((count+1))
   [[ $count -ge $LIMIT ]] && break
 done
@@ -58,6 +70,15 @@ if [[ "$TEST_UPLOAD" == "true" ]]; then
   jq -c '{encoding, count: (.lines|length)}' /tmp/up_read.json || true
   curl -s -X POST "$BACKEND_URL/header/iq" -F file=@"$first" -o /tmp/up_iq.json -w "code=%{http_code}\n" | sed 's/.*/iq(up)   -> &/'
   jq -c '{datum: .datum.value, sample_interval_ms: .sample_interval_ms.value, record_length_ms: .record_length_ms.value}' /tmp/up_iq.json || true
+  # parse (upload): reuse lines from the upload read result
+  if [[ -s /tmp/up_read.json ]]; then
+    jq -c '{lines: .lines, use_llm: true}' /tmp/up_read.json > /tmp/up_parse_body.json || true
+    curl -s -X POST "$BACKEND_URL/header/parse" \
+      -H "Content-Type: application/json" \
+      -d @/tmp/up_parse_body.json \
+      -o /tmp/up_parse.json -w "code=%{http_code}\n" | sed 's/.*/parse(up) -> &/'
+    jq -c '{header_non_null: (.header|to_entries|map(select(.value != null))|map(.key)), provenance_count: (.provenance|length)}' /tmp/up_parse.json || true
+  fi
 fi
 
 echo -e "\n-- Negative case (missing form fields) --"
