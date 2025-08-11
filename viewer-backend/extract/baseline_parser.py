@@ -35,6 +35,33 @@ def _maybe_ms(value: float) -> float:
     return value
 
 
+def _to_float(num: str) -> float:
+    """Parse a numeric string allowing separators like commas/underscores/spaces.
+
+    Examples: "2,000" -> 2000.0, "1 000.5" -> 1000.5
+    """
+    cleaned = num.replace(",", "").replace("_", "").replace(" ", "")
+    # normalize micro symbol if present elsewhere in the string (handled in regex units anyway)
+    return float(cleaned)
+
+
+def _clean_text_capture(raw: str, label_hint: Optional[str] = None) -> Optional[str]:
+    """Normalize free-text captures; drop empty or placeholder values.
+
+    Returns an UPPERCASED string or None if deemed empty/placeholder.
+    """
+    val = (raw or "").strip()
+    if not val:
+        return None
+    upper = val.upper()
+    placeholders = {"N/A", "NA", "NONE", "UNKNOWN", "NULL", "-"}
+    if label_hint:
+        placeholders.add(label_hint.upper())
+    if upper in placeholders:
+        return None
+    return upper
+
+
 def parse_baseline(lines: List[str]) -> Dict[str, FieldEvidence]:
     """Deterministic baseline extraction from textual header.
 
@@ -45,12 +72,34 @@ def parse_baseline(lines: List[str]) -> Dict[str, FieldEvidence]:
     # ------------------------------
     # Numeric: sample_interval_ms
     # ------------------------------
-    # Priority 1: explicit "... MS"
+    # Priority 1: explicit with units (MS/MSEC/USEC/US/SEC)
     for idx, line in enumerate(lines):
+        # First try library extractor (commonly handles ms)
         v = match_sample_interval_ms(line)
         if v:
             out["sample_interval_ms"] = FieldEvidence(
                 value=float(v[0]), confidence=0.9, line_refs=[idx + 1]
+            )
+            break
+        # Fallback explicit microseconds / seconds
+        m = re.search(
+            r"SAMPLE\s+INTER\w*\s*[:=]?\s*([0-9,._ ]*\.?[0-9]+)\s*(MSEC|MILLISECONDS?|MS|USEC|MICROSECONDS?|US|µS|S|SEC|SECONDS?)\b",
+            line,
+            re.IGNORECASE,
+        )
+        if m:
+            raw = _to_float(m.group(1))
+            unit = m.group(2).upper()
+            if unit in ("MS", "MSEC", "MILLISECONDS", "MILLISECOND"):
+                val_ms = raw
+            elif unit in ("USEC", "US", "MICROSECONDS", "MICROSECOND", "µS"):
+                val_ms = raw / 1000.0
+            elif unit in ("S", "SEC", "SECONDS", "SECOND"):
+                val_ms = raw * 1000.0
+            else:
+                val_ms = raw
+            out["sample_interval_ms"] = FieldEvidence(
+                value=float(val_ms), confidence=0.88, line_refs=[idx + 1]
             )
             break
 
@@ -58,12 +107,12 @@ def parse_baseline(lines: List[str]) -> Dict[str, FieldEvidence]:
     if "sample_interval_ms" not in out:
         for idx, line in enumerate(lines):
             m = re.search(
-                r"SAMPLE\s+INTER\w*\s*[:=]?\s*([0-9]*\.?[0-9]+)(?:\s|$)",
+                r"SAMPLE\s+INTER\w*\s*[:=]?\s*([0-9,._ ]*\.?[0-9]+)(?:\s|$)",
                 line,
                 re.IGNORECASE,
             )
             if m:
-                raw = float(m.group(1))
+                raw = _to_float(m.group(1))
                 val = _maybe_ms(raw)
                 conf = 0.85 if 100 <= raw <= 10000 else 0.7
                 out["sample_interval_ms"] = FieldEvidence(
@@ -85,18 +134,32 @@ def parse_baseline(lines: List[str]) -> Dict[str, FieldEvidence]:
     # ------------------------------
     # Numeric: record_length_ms
     # ------------------------------
-    # Priority 1: explicit pattern "RECORD LENGTH ... MS" or variants
+    # Priority 1: explicit pattern with units (MS/MSEC/SEC)
     res = _search_lines(
         lines,
         [
-            re.compile(r"RECORD\s+LENGTH\s*[:=]?\s*([0-9]*\.?[0-9]+)\s*MS", re.IGNORECASE),
-            re.compile(r"RLEN(?:GTH)?\s*[:=]?\s*([0-9]*\.?[0-9]+)\s*MS", re.IGNORECASE),
+            re.compile(
+                r"RECORD\s+LENGTH\s*[:=]?\s*([0-9,._ ]*\.?[0-9]+)\s*(MSEC|MILLISECONDS?|MS|S|SEC|SECONDS?)\b",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                r"RLEN(?:GTH)?\s*[:=]?\s*([0-9,._ ]*\.?[0-9]+)\s*(MSEC|MILLISECONDS?|MS|S|SEC|SECONDS?)\b",
+                re.IGNORECASE,
+            ),
         ],
     )
     if res:
         line_no, m = res
+        raw = _to_float(m.group(1))
+        unit = m.group(2).upper()
+        if unit in ("MS", "MSEC", "MILLISECONDS", "MILLISECOND"):
+            rl_ms = raw
+        elif unit in ("S", "SEC", "SECONDS", "SECOND"):
+            rl_ms = raw * 1000.0
+        else:
+            rl_ms = raw
         out["record_length_ms"] = FieldEvidence(
-            value=float(m.group(1)), confidence=0.9, line_refs=[line_no]
+            value=float(rl_ms), confidence=0.9, line_refs=[line_no]
         )
 
     # Priority 2: derive from samples_per_trace * sample_interval_ms
@@ -104,8 +167,12 @@ def parse_baseline(lines: List[str]) -> Dict[str, FieldEvidence]:
         si = out.get("sample_interval_ms")
         spt = out.get("samples_per_trace")
         if si and spt:
+            derived = float(si.value) * int(spt.value)
+            # reduce tiny float artifacts
+            if abs(derived - round(derived)) < 1e-6:
+                derived = float(round(derived))
             out["record_length_ms"] = FieldEvidence(
-                value=float(si.value) * int(spt.value),
+                value=derived,
                 confidence=min(si.confidence, spt.confidence),
                 line_refs=sorted(set(si.line_refs + spt.line_refs)),
             )
@@ -113,11 +180,18 @@ def parse_baseline(lines: List[str]) -> Dict[str, FieldEvidence]:
     # ------------------------------
     # Additional high-signal numeric tokens
     # ------------------------------
-    res = _search_lines(lines, [re.compile(r"DATA\s+TRACES\s*/\s*RECORD\s+(\d+)", re.IGNORECASE)])
+    # Broaden to match TRACE/RECORD, TRACES/RECORDS, with optional DATA prefix
+    res = _search_lines(
+        lines,
+        [
+            re.compile(r"(?:DATA\s+)?TRACES?\s*/\s*RECORDS?\s*[:=]?\s*(?P<n>\d+)", re.IGNORECASE),
+        ],
+    )
     if res:
         line_no, m = res
+        n = int(m.group("n")) if "n" in m.groupdict() else int(m.group(1))
         out["data_traces_per_record"] = FieldEvidence(
-            value=int(m.group(1)), confidence=0.8, line_refs=[line_no]
+            value=n, confidence=0.8, line_refs=[line_no]
         )
 
     res = _search_lines(lines, [re.compile(r"AUXILIARY\s+TRACES\s*/\s*RECORD\s+(\d+)", re.IGNORECASE)])
@@ -131,31 +205,76 @@ def parse_baseline(lines: List[str]) -> Dict[str, FieldEvidence]:
     # Free-text tokens
     # ------------------------------
     res = _search_lines(
-        lines, [re.compile(r"COMPANY\s*[:=]?\s*([A-Z0-9 &\-_/]+?)(?:\s{2,}|$)", re.IGNORECASE)]
+        lines, [re.compile(r"COMPANY\s*[:=]?\s*([A-Z0-9 .,&'\-_/]+?)(?:\s{2,}|$)", re.IGNORECASE)]
     )
     if res:
         line_no, m = res
-        out["company"] = FieldEvidence(
-            value=m.group(1).strip().upper(), confidence=0.8, line_refs=[line_no]
-        )
+        val = _clean_text_capture(m.group(1), label_hint="COMPANY")
+        if val:
+            out["company"] = FieldEvidence(
+                value=val, confidence=0.8, line_refs=[line_no]
+            )
 
     res = _search_lines(
-        lines, [re.compile(r"CLIENT\s*[:=]?\s*([A-Z0-9 &\-_/]+?)(?:\s{2,}|$)", re.IGNORECASE)]
+        lines, [re.compile(r"CLIENT\s*[:=]?\s*([A-Z0-9 .,&'\-_/]+?)(?:\s{2,}|$)", re.IGNORECASE)]
     )
     if res:
         line_no, m = res
-        out["client"] = FieldEvidence(
-            value=m.group(1).strip().upper(), confidence=0.7, line_refs=[line_no]
-        )
+        val = _clean_text_capture(m.group(1), label_hint="CLIENT")
+        if val:
+            out["client"] = FieldEvidence(
+                value=val, confidence=0.7, line_refs=[line_no]
+            )
 
     res = _search_lines(
-        lines, [re.compile(r"AREA\s*[:=]?\s*([A-Z0-9 &\-_/]+?)(?:\s{2,}|$)", re.IGNORECASE)]
+        lines, [re.compile(r"AREA\s*[:=]?\s*([A-Z0-9 .,&'\-_/]+?)(?:\s{2,}|$)", re.IGNORECASE)]
     )
     if res:
         line_no, m = res
-        out["area"] = FieldEvidence(
-            value=m.group(1).strip().upper(), confidence=0.7, line_refs=[line_no]
-        )
+        val = _clean_text_capture(m.group(1), label_hint="AREA")
+        if val:
+            out["area"] = FieldEvidence(
+                value=val, confidence=0.7, line_refs=[line_no]
+            )
+
+    # Contractor
+    res = _search_lines(
+        lines, [re.compile(r"CONTRACTOR\s*[:=]?\s*([A-Z0-9 .,&'\-_/]+?)(?:\s{2,}|$)", re.IGNORECASE)]
+    )
+    if res:
+        line_no, m = res
+        val = _clean_text_capture(m.group(1), label_hint="CONTRACTOR")
+        if val:
+            out["contractor"] = FieldEvidence(
+                value=val, confidence=0.7, line_refs=[line_no]
+            )
+
+    # Survey/Project name
+    res = _search_lines(
+        lines, [re.compile(r"PROJECT\s+NAME\s*[:=]?\s*(.+?)(?:\s{2,}|$)", re.IGNORECASE)]
+    )
+    if res:
+        line_no, m = res
+        val = _clean_text_capture(m.group(1), label_hint="PROJECT NAME")
+        if val:
+            out["survey_name"] = FieldEvidence(
+                value=val, confidence=0.75, line_refs=[line_no]
+            )
+
+    # Acquisition year (from DATE: YYYY ...)
+    res = _search_lines(
+        lines, [re.compile(r"\bDATE\s*[:=]?\s*(\d{4})\b", re.IGNORECASE)]
+    )
+    if res:
+        line_no, m = res
+        try:
+            year = int(m.group(1))
+            if 1900 <= year <= 2100:
+                out["acquisition_year"] = FieldEvidence(
+                    value=year, confidence=0.6, line_refs=[line_no]
+                )
+        except Exception:
+            pass
 
     # Recording format
     res = _search_lines(
@@ -183,5 +302,17 @@ def parse_baseline(lines: List[str]) -> Dict[str, FieldEvidence]:
         elif ms in ("IMPERIAL", "FEET", "FT"):
             ms = "FEET"
         out["measurement_system"] = FieldEvidence(value=ms, confidence=0.65, line_refs=[line_no])
+
+    # Endianness hint — flag little-endian as non-standard per SEG-Y Rev1
+    res = _search_lines(
+        lines, [re.compile(r"\b(LITTLE|BIG)\s+ENDIAN\b", re.IGNORECASE)]
+    )
+    if res:
+        line_no, m = res
+        if m.group(1).strip().upper() == "LITTLE":
+            note = (
+                "Textual header indicates LITTLE ENDIAN; SEG-Y Rev1 specifies big-endian. File may be non-standard."
+            )
+            out.setdefault("notes", FieldEvidence(value=note, confidence=0.5, line_refs=[line_no]))
 
     return out

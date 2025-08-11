@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import traceback
 from typing import Dict, List, Protocol, Tuple, Any
 
 from app.schemas import FieldEvidence, HeaderJSON
