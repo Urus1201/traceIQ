@@ -17,3 +17,7 @@
 ## Lint/Test
 - Backend: `pytest`, `ruff`, `black`
 - Frontend: `npm run lint`, `npm run format`
+
+Zero-shot header -> JSON structuring
+Converts the free-form header text into a clean, typed JSON (survey name, contractor, acquisition date, sample rate, coordinate system, etc.).
+Prompt-engineering with GPT-4o or fine-tune a small LLM on <header, JSON> pairs; fallback rules for edge cases.

@@ -32,3 +32,35 @@ BACKEND_URL=http://localhost:8000 ./scripts/api-smoke.sh -n 4 -u
 ```
 
 The script prints HTTP status codes and a compact JSON summary of fields detected by `/header/iq`. If a value looks noisy (e.g., contractor lines from legal disclaimers), consider refining the heuristics in `viewer-backend/app/iq_parser.py`.
+
+---
+
+# Offline Evaluation: Baseline vs LLM
+
+`eval_iq.py` lets you compare the baseline parser with the LLM extractor without touching production code. It prints per-field diffs, simple aggregate stats, and (optionally) compares key numerics against the binary header as weak ground truth.
+
+Requirements:
+- Python 3.10+
+- Optional: Azure OpenAI env vars set to enable LLM; otherwise runs baseline-only.
+
+Usage examples:
+```bash
+# Pretty print results for up to 4 files in ./data
+python3 scripts/eval_iq.py --limit 4
+
+# Include fields where baseline and LLM agree (by default, only diffs are shown)
+python3 scripts/eval_iq.py --limit 4 --show-agree
+
+# Write JSON report
+python3 scripts/eval_iq.py --limit 10 --format json --output eval.json
+
+# CSV of per-field rows
+python3 scripts/eval_iq.py --limit 10 --format csv --output eval.csv
+```
+
+Enable LLM (Azure OpenAI):
+- AZURE_OPENAI_ENDPOINT
+- AZURE_OPENAI_API_KEY
+- optional: AZURE_OPENAI_API_VERSION, AZURE_OPENAI_DEPLOYMENT
+
+The script reports counts of how many fields the LLM added, overrode, and agreed with baseline, plus correctness vs. binary header (if available via `segyio`).

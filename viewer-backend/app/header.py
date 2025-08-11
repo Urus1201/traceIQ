@@ -20,6 +20,8 @@ import json
 from typing import Optional, List
 from fastapi import Body
 from pydantic import BaseModel, field_validator
+from typing import Any, Dict
+from app.crs.solver import solve_crs
 
 router = APIRouter()
 
@@ -332,3 +334,33 @@ async def parse_header(req: ParseRequest, provider: LLMProvider = Depends(get_ll
 
     provenance = [ProvenanceEntry(**p) for p in prov]
     return ParseResponse(header=hj, provenance=provenance)
+
+
+class CRSSolveRequest(BaseModel):
+        lines: List[str]
+        bin_header: Dict[str, Any] | None = None
+        trace_stats: Dict[str, Any] | None = None
+
+        @field_validator("lines")
+        @classmethod
+        def _normalize_lines_crs(cls, v: List[str]) -> List[str]:
+                if not isinstance(v, list) or len(v) == 0:
+                        raise ValueError("'lines' must be a non-empty list of strings")
+                # Keep as-is; CRS heuristics do not require exactly 40 lines but we cap to 200 for safety
+                v = [str(x) for x in v[:200]]
+                return v
+
+
+@router.post("/header/crs_solve")
+async def crs_solve(req: CRSSolveRequest):
+        """Phase-4 CRS ranker: returns candidate EPSG codes with probabilities and diagnostics.
+
+        Body schema:
+            {
+                "lines": ["C01 ...", ...],
+                "bin_header": {"sample_interval": 1000},
+                "trace_stats": {"grid_dx": 25.0, "grid_dy": 25.0, "units": "m"}
+            }
+        """
+        result = solve_crs(req.lines, bin_header=req.bin_header, trace_stats=req.trace_stats)
+        return result
