@@ -69,20 +69,31 @@ async def header_iq(file: UploadFile = File(None), path: str = Form(None)) -> He
 
 
 @router.post("/header/read_binary")
-async def read_binary(payload: dict = Body(...)):
+async def read_binary(file: UploadFile = File(None), path: str = Form(None)):
     """Read minimal binary header fields using segyio if available.
-    Body: { path: "..." }
+    Accepts either an uploaded file or a filesystem path.
     Returns: { sample_interval_us, samples_per_trace, format_code }
     """
-    path = payload.get("path")
-    if not path:
-        return JSONResponse(status_code=400, content={"error": "Missing 'path'"})
-    stub = read_binary_header(path)
-    return {
-        "sample_interval_us": stub.sample_interval_us,
-        "samples_per_trace": stub.samples_per_trace,
-        "format_code": stub.format_code,
-    }
+    tmp_path = None
+    try:
+        if file:
+            with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                content = await file.read()
+                tmp.write(content)
+                tmp_path = tmp.name
+            stub = read_binary_header(tmp_path)
+        elif path:
+            stub = read_binary_header(path)
+        else:
+            return JSONResponse(status_code=400, content={"error": "No file or path provided"})
+        return {
+            "sample_interval_us": stub.sample_interval_us,
+            "samples_per_trace": stub.samples_per_trace,
+            "format_code": stub.format_code,
+        }
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 @router.get("/header/preview_text")
@@ -175,6 +186,7 @@ def _peek_first_trace_samples(path: str) -> Optional[int]:
         return None
 
 
+
 @router.post("/header/apply_patch")
 async def apply_patch(payload: dict = Body(...)):
     """Create a sidecar JSON aligning textual header fields with binary header.
@@ -187,98 +199,101 @@ async def apply_patch(payload: dict = Body(...)):
       - source for corrected fields: "binary"
       - binary_peek: optional validation of samples_per_trace from first trace
     """
-    path = payload.get("path")
-    if not path:
-        return JSONResponse(status_code=400, content={"error": "Missing 'path'"})
+    try:
+        path = payload.get("path")
+        if not path:
+            return JSONResponse(status_code=400, content={"error": "Missing 'path'"})
 
-    # Gather text-derived sanity and binary header
-    hdr = read_text_header(path)
-    lines = hdr["lines"]
-    text_sanity = {}
+        # Gather text-derived sanity and binary header
+        hdr = read_text_header(path)
+        lines = hdr["lines"]
+        text_sanity = {}
 
-    # reuse the logic in header_sanity (L5/L6 expectations)
-    if len(lines) >= 6:
-        l6 = lines[5]
-        s = match_samples_per_trace(l6)
-        b = match_bytes_per_sample(l6)
-        if b:
-            text_sanity["sample_interval_ms"] = {
-                "value": b[0],
-                "confidence": 0.9,
-                "line_refs": [6],
-                "raw_spans": [b[1]],
-            }
-        if s:
-            text_sanity["samples_per_trace"] = {
-                "value": s[0],
-                "confidence": 0.9,
-                "line_refs": [6],
-                "raw_spans": [s[1]],
-            }
+        # reuse the logic in header_sanity (L5/L6 expectations)
+        if len(lines) >= 6:
+            l6 = lines[5]
+            s = match_samples_per_trace(l6)
+            b = match_bytes_per_sample(l6)
+            if b:
+                text_sanity["sample_interval_ms"] = {
+                    "value": b[0],
+                    "confidence": 0.9,
+                    "line_refs": [6],
+                    "raw_spans": [b[1]],
+                }
+            if s:
+                text_sanity["samples_per_trace"] = {
+                    "value": s[0],
+                    "confidence": 0.9,
+                    "line_refs": [6],
+                    "raw_spans": [s[1]],
+                }
 
-    text_sanity.update(sanity_derive_from_text(lines))
+        text_sanity.update(sanity_derive_from_text(lines))
 
-    bin_stub = read_binary_header(path)
-    bin_dict = {
-        "sample_interval_us": bin_stub.sample_interval_us,
-        "samples_per_trace": bin_stub.samples_per_trace,
-        "format_code": bin_stub.format_code,
-    }
-
-    # Consistency check and patch proposal
-    result = check_text_vs_binary(text_sanity, bin_dict)
-
-    corrected = {}
-    for item in result.get("suggested_patch", []):
-        corrected[item["field"]] = {
-            "value": item["new_value"],
-            "source": "binary",
-            "rationale": item.get("rationale"),
+        bin_stub = read_binary_header(path)
+        bin_dict = {
+            "sample_interval_us": bin_stub.sample_interval_us,
+            "samples_per_trace": bin_stub.samples_per_trace,
+            "format_code": bin_stub.format_code,
         }
 
-    # Optional binary peek validator
-    peek_samples = _peek_first_trace_samples(path)
-    binary_peek = {
-        "first_trace_samples": peek_samples,
-        "validated": (peek_samples is not None and corrected.get("samples_per_trace", {}).get("value") == peek_samples),
-    }
+        # Consistency check and patch proposal
+        result = check_text_vs_binary(text_sanity, bin_dict)
 
-    sidecar = {
-        "original_text": text_sanity,
-        "corrected": corrected,
-        "issues": result.get("issues", []),
-        "binary": bin_dict,
-        "binary_peek": binary_peek,
-    }
+        corrected = {}
+        for item in result.get("suggested_patch", []):
+            corrected[item["field"]] = {
+                "value": item["new_value"],
+                "source": "binary",
+                "rationale": item.get("rationale"),
+            }
 
-    sidecar_path = f"{path}.header.sidecar.json"
-    note: Optional[str] = None
-    try:
-        with open(sidecar_path, "w", encoding="utf-8") as f:
-            json.dump(sidecar, f, indent=2)
-        written_path = sidecar_path
-    except Exception:
-        # Read-only dir (e.g., /data). Fall back to SIDECAR_DIR or /app/sidecars
-        fallback_dir = os.environ.get("SIDECAR_DIR", "/app/sidecars")
+        # Optional binary peek validator
+        peek_samples = _peek_first_trace_samples(path)
+        binary_peek = {
+            "first_trace_samples": peek_samples,
+            "validated": (peek_samples is not None and corrected.get("samples_per_trace", {}).get("value") == peek_samples),
+        }
+
+        sidecar = {
+            "original_text": text_sanity,
+            "corrected": corrected,
+            "issues": result.get("issues", []),
+            "binary": bin_dict,
+            "binary_peek": binary_peek,
+        }
+
+        sidecar_path = f"{path}.header.sidecar.json"
+        note: Optional[str] = None
         try:
-            os.makedirs(fallback_dir, exist_ok=True)
-            fallback_path = os.path.join(
-                fallback_dir, os.path.basename(sidecar_path)
-            )
-            with open(fallback_path, "w", encoding="utf-8") as f:
+            with open(sidecar_path, "w", encoding="utf-8") as f:
                 json.dump(sidecar, f, indent=2)
-            written_path = fallback_path
-            note = f"Primary location not writable; wrote to {fallback_dir}"
-        except Exception as e2:
-            return JSONResponse(
-                status_code=500,
-                content={"error": f"Failed to write sidecar: {e2}"},
-            )
+            written_path = sidecar_path
+        except Exception:
+            # Read-only dir (e.g., /data). Fall back to SIDECAR_DIR or /app/sidecars
+            fallback_dir = os.environ.get("SIDECAR_DIR", "/app/sidecars")
+            try:
+                os.makedirs(fallback_dir, exist_ok=True)
+                fallback_path = os.path.join(
+                    fallback_dir, os.path.basename(sidecar_path)
+                )
+                with open(fallback_path, "w", encoding="utf-8") as f:
+                    json.dump(sidecar, f, indent=2)
+                written_path = fallback_path
+                note = f"Primary location not writable; wrote to {fallback_dir}"
+            except Exception as e2:
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": f"Failed to write sidecar: {e2}"},
+                )
 
-    resp = {"written": written_path, **sidecar}
-    if note:
-        resp["note"] = note
-    return resp
+        resp = {"written": written_path, **sidecar}
+        if note:
+            resp["note"] = note
+        return resp
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 
 class _NoopProvider:
