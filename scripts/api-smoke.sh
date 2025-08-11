@@ -57,6 +57,16 @@ for f in "${files[@]}"; do
     if [[ -s /tmp/parse.json ]]; then
       jq -c '{header_non_null: (.header|to_entries|map(select(.value != null))|map(.key)), provenance_count: (.provenance|length)}' /tmp/parse.json || true
     fi
+
+    # header/crs_solve using lines from /header/read (trace_stats left empty)
+    jq -c '{lines: .lines}' /tmp/read.json > /tmp/crs_body.json || true
+    curl -s -X POST "$BACKEND_URL/header/crs_solve" \
+      -H "Content-Type: application/json" \
+      -d @/tmp/crs_body.json \
+      -o /tmp/crs.json -w "code=%{http_code}\n" | sed 's/.*/crs  -> &/'
+    if [[ -s /tmp/crs.json ]]; then
+      jq -c '{top1: (.candidates[0] // {}), candidates: (.candidates|length), notes: (.diagnostics.notes // [])}' /tmp/crs.json || true
+    fi
   fi
 
   count=$((count+1))
@@ -78,6 +88,14 @@ if [[ "$TEST_UPLOAD" == "true" ]]; then
       -d @/tmp/up_parse_body.json \
       -o /tmp/up_parse.json -w "code=%{http_code}\n" | sed 's/.*/parse(up) -> &/'
     jq -c '{header_non_null: (.header|to_entries|map(select(.value != null))|map(.key)), provenance_count: (.provenance|length)}' /tmp/up_parse.json || true
+
+    # crs_solve (upload): reuse lines from upload read
+    jq -c '{lines: .lines}' /tmp/up_read.json > /tmp/up_crs_body.json || true
+    curl -s -X POST "$BACKEND_URL/header/crs_solve" \
+      -H "Content-Type: application/json" \
+      -d @/tmp/up_crs_body.json \
+      -o /tmp/up_crs.json -w "code=%{http_code}\n" | sed 's/.*/crs(up)  -> &/'
+    jq -c '{top1: (.candidates[0] // {}), candidates: (.candidates|length), notes: (.diagnostics.notes // [])}' /tmp/up_crs.json || true
   fi
 fi
 
