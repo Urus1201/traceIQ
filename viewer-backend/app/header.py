@@ -110,9 +110,16 @@ async def header_iq(
         lines = hdr.get("lines") if isinstance(hdr, dict) else None
         if not isinstance(lines, list):
             raise HTTPException(status_code=500, detail="read_text_header returned unexpected structure (missing 'lines')")
-        if len(lines) != 40:
-            # Continue but lower confidence; still useful for partial headers. Treat as 422 so caller sees issue.
-            raise HTTPException(status_code=422, detail=f"Expected 40 header lines, got {len(lines)}")
+        original_len = len(lines)
+        warning: Optional[str] = None
+        if original_len < 40:
+            # Pad with blanks so downstream parser logic (expects up to 40) remains safe
+            lines = list(lines) + [""] * (40 - original_len)
+            warning = f"Textual header shorter than 40 lines (got {original_len}); padded with blanks for parsing"
+        elif original_len > 40:
+            # Truncate extra (SEG-Y textual header should be exactly 40*80; extra lines likely noise)
+            lines = list(lines)[:40]
+            warning = f"Textual header longer than 40 lines (got {original_len}); truncated to first 40"
 
         # Optional caching
         cache = getattr(request.app.state, "cache", None)
@@ -137,6 +144,15 @@ async def header_iq(
         except Exception as e:
             logging.exception("parse_header_iq crashed")
             raise HTTPException(status_code=500, detail=f"Parser failure: {type(e).__name__}: {e}")
+        # Attach warning as notes if needed
+        if warning:
+            from app.schemas import FieldEvidence  # local import to avoid circular
+            if parsed.notes is None:
+                parsed.notes = FieldEvidence(value=warning, confidence=0.3, line_refs=[])
+            else:
+                prior = str(parsed.notes.value) if parsed.notes.value else ""
+                combined = f"{prior} | {warning}" if prior else warning
+                parsed.notes.value = combined  # type: ignore[attr-defined]
 
         if cache and cache_key:
             try:

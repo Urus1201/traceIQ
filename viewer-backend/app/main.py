@@ -2,10 +2,13 @@ from fastapi import FastAPI
 from app.header import router as header_router
 from extract.providers import build_provider_from_env
 from app.cache import build_cache_from_env
+from app.logging_setup import configure_logging, logging_middleware
 import asyncio
 
 def create_app() -> FastAPI:
+    configure_logging()
     app = FastAPI()
+    app.middleware("http")(logging_middleware)
 
     @app.get("/health")
     def health():
