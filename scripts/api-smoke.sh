@@ -34,17 +34,23 @@ count=0
 for f in "${files[@]}"; do
   bn=$(basename "$f")
   printf '\n== %s ==\n' "$bn"
-  # header/read via path (container sees /data)
-  curl -s -X POST "$BACKEND_URL/header/read" -F path="/data/$bn" -o /tmp/read.json -w "code=%{http_code}\n" \
+  # Determine path to use: prefer /data mount if accessible, else host path
+  if [[ -f "/data/$bn" ]]; then
+    PATH_ARG="/data/$bn"
+  else
+    PATH_ARG="$f"
+  fi
+  # header/read via path
+  curl -s -X POST "$BACKEND_URL/header/read" -F path="$PATH_ARG" -o /tmp/read.json -w "code=%{http_code}\n" \
     | sed 's/.*/read -> &/'
   if [[ -s /tmp/read.json ]]; then
     jq -c '{encoding, count: (.lines|length), first: .lines[0], last: .lines[-1]}' /tmp/read.json || true
   fi
-  # header/iq via path
-  curl -s -X POST "$BACKEND_URL/header/iq" -F path="/data/$bn" -o /tmp/iq.json -w "code=%{http_code}\n" \
+  # header/iq via path (now always multi-field LLM parser when provider configured)
+  curl -s -X POST "$BACKEND_URL/header/iq" -F path="$PATH_ARG" -o /tmp/iq.json -w "code=%{http_code}\n" \
     | sed 's/.*/iq   -> &/'
   if [[ -s /tmp/iq.json ]]; then
-    jq -c 'to_entries|map(select(.value != null))|map({k: .key, v: (if (.value|type)=="object" then .value.value else .value end)})' /tmp/iq.json || true
+    jq -c 'def flat: to_entries|map(select(.value != null))|map({k: .key, v: (if (.value|type)=="object" then .value.value else .value end)}); {field_count: (flat|length), fields: (flat|map(.k)), sample_interval_ms: .sample_interval_ms.value, record_length_ms: .record_length_ms.value}' /tmp/iq.json || true
   fi
 
   # header/parse using lines from /header/read (baseline only; set use_llm=true to enable LLM fallback if configured)
@@ -79,7 +85,7 @@ if [[ "$TEST_UPLOAD" == "true" ]]; then
   curl -s -X POST "$BACKEND_URL/header/read" -F file=@"$first" -o /tmp/up_read.json -w "code=%{http_code}\n" | sed 's/.*/read(up) -> &/'
   jq -c '{encoding, count: (.lines|length)}' /tmp/up_read.json || true
   curl -s -X POST "$BACKEND_URL/header/iq" -F file=@"$first" -o /tmp/up_iq.json -w "code=%{http_code}\n" | sed 's/.*/iq(up)   -> &/'
-  jq -c '{datum: .datum.value, sample_interval_ms: .sample_interval_ms.value, record_length_ms: .record_length_ms.value}' /tmp/up_iq.json || true
+  jq -c '{field_count: ([to_entries[]|select(.value!=null)]|length), datum: .datum.value, sample_interval_ms: .sample_interval_ms.value, record_length_ms: .record_length_ms.value}' /tmp/up_iq.json || true
   # parse (upload): reuse lines from the upload read result
   if [[ -s /tmp/up_read.json ]]; then
     jq -c '{lines: .lines, use_llm: true}' /tmp/up_read.json > /tmp/up_parse_body.json || true

@@ -4,7 +4,7 @@ import logging
 from fastapi.responses import JSONResponse
 from segy.header_io import read_text_header
 from app.schemas import HeaderJSON, ParseResponse, ProvenanceEntry
-from app.iq_parser import parse_header_iq
+from app.iq_parser import parse_header_iq  # unified async parser
 from extract.baseline_parser import parse_baseline
 from extract.llm_fallback import run_llm, merge_with_confidence, LLMProvider
 from segy.binary_header import read_binary_header
@@ -69,6 +69,7 @@ async def header_iq(
     Raises explicit HTTP errors for common failure modes instead of generic 500.
     """
     tmp_path: Optional[str] = None
+    # Unified parser (async multi-field LLM-first) always enabled
     try:
         # Guard against both or neither inputs
         if file and path:
@@ -138,7 +139,7 @@ async def header_iq(
                     pass
 
         try:
-            parsed = parse_header_iq(lines)
+            parsed = await parse_header_iq(lines)
         except HTTPException:
             raise
         except Exception as e:
