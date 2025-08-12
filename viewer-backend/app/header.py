@@ -133,10 +133,15 @@ async def header_iq(
                 cached = None
             if cached:
                 try:
+                    if os.getenv("IQ_CACHE_LOG") == "1":  # optional cache hit logging
+                        logging.info("header_iq cache HIT key=%s", cache_key)
                     return HeaderJSON(**cached)
                 except Exception:
                     # Corrupt cache entry: ignore
                     pass
+            else:
+                if os.getenv("IQ_CACHE_LOG") == "1":  # optional cache miss logging
+                    logging.info("header_iq cache MISS key=%s", cache_key)
 
         try:
             parsed = await parse_header_iq(lines)
@@ -158,6 +163,8 @@ async def header_iq(
         if cache and cache_key:
             try:
                 await cache.set_json(cache_key, parsed.model_dump())  # type: ignore[attr-defined]
+                if os.getenv("IQ_CACHE_LOG") == "1":  # optional cache store logging
+                    logging.info("header_iq cache STORE key=%s", cache_key)
             except Exception:
                 pass
         return parsed
