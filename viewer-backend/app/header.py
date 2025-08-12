@@ -1,4 +1,6 @@
 from fastapi import APIRouter, UploadFile, File, Form, Query, Depends, Request
+from fastapi import HTTPException
+import logging
 from fastapi.responses import JSONResponse
 from segy.header_io import read_text_header
 from app.schemas import HeaderJSON, ParseResponse, ProvenanceEntry
@@ -43,39 +45,137 @@ async def read_header(file: UploadFile = File(None), path: str = Form(None)):
     return {"encoding": result["encoding"], "lines": result["lines"]}
 
 
+import hashlib
+
+
+def _hash_lines(lines):
+    h = hashlib.sha1()
+    for ln in lines:
+        h.update((ln or "").encode("utf-8", errors="ignore"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
 @router.post("/header/iq", response_model=HeaderJSON)
-async def header_iq(file: UploadFile = File(None), path: str = Form(None)) -> HeaderJSON:
-    """Parse textual header into structured HeaderJSON.
-    Accepts either an uploaded file or a filesystem path.
+async def header_iq(
+    request: Request,
+    file: UploadFile = File(None),
+    path: str = Form(None),
+) -> HeaderJSON:
+    """Parse textual SEG-Y header (textual 3200 bytes -> 40x80 lines) into structured HeaderJSON.
+
+    Accepts either an uploaded file (multipart) or a filesystem path provided as form field 'path'.
+    Returns a HeaderJSON (possibly empty if nothing recognized).
+    Raises explicit HTTP errors for common failure modes instead of generic 500.
     """
-    tmp_path = None
+    tmp_path: Optional[str] = None
     try:
+        # Guard against both or neither inputs
+        if file and path:
+            raise HTTPException(status_code=400, detail="Provide either 'file' or 'path', not both")
+        if not file and not path:
+            raise HTTPException(status_code=400, detail="No file or path provided")
+
         if file:
+            # Persist upload to a temp file for existing read_text_header API
             with tempfile.NamedTemporaryFile(delete=False) as tmp:
                 content = await file.read()
+                if not content:
+                    raise HTTPException(status_code=400, detail="Uploaded file is empty")
                 tmp.write(content)
                 tmp_path = tmp.name
-            hdr = read_text_header(tmp_path)
-        elif path:
-            hdr = read_text_header(path)
-        else:
-            return HeaderJSON()
+            try:
+                hdr = read_text_header(tmp_path)
+            except FileNotFoundError:
+                raise HTTPException(status_code=500, detail="Temporary file disappeared before reading")
+            except ValueError as ve:
+                # Likely not a valid SEG-Y (short header)
+                raise HTTPException(status_code=422, detail=f"Invalid SEG-Y textual header: {ve}")
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Failed to read uploaded header: {e}")
+        else:  # path case
+            if not os.path.exists(path):
+                raise HTTPException(status_code=404, detail=f"Path not found: {path}")
+            if not os.path.isfile(path):
+                raise HTTPException(status_code=400, detail=f"Not a regular file: {path}")
+            try:
+                hdr = read_text_header(path)
+            except PermissionError:
+                raise HTTPException(status_code=403, detail=f"Permission denied: {path}")
+            except ValueError as ve:
+                raise HTTPException(status_code=422, detail=f"Invalid SEG-Y textual header: {ve}")
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Failed to read textual header: {e}")
 
-        lines = hdr["lines"]
-        return parse_header_iq(lines)
+        lines = hdr.get("lines") if isinstance(hdr, dict) else None
+        if not isinstance(lines, list):
+            raise HTTPException(status_code=500, detail="read_text_header returned unexpected structure (missing 'lines')")
+        if len(lines) != 40:
+            # Continue but lower confidence; still useful for partial headers. Treat as 422 so caller sees issue.
+            raise HTTPException(status_code=422, detail=f"Expected 40 header lines, got {len(lines)}")
+
+        # Optional caching
+        cache = getattr(request.app.state, "cache", None)
+        cache_key = None
+        if cache:
+            cache_key = f"iq:{_hash_lines(lines)}"
+            try:
+                cached = await cache.get_json(cache_key)
+            except Exception:
+                cached = None
+            if cached:
+                try:
+                    return HeaderJSON(**cached)
+                except Exception:
+                    # Corrupt cache entry: ignore
+                    pass
+
+        try:
+            parsed = parse_header_iq(lines)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logging.exception("parse_header_iq crashed")
+            raise HTTPException(status_code=500, detail=f"Parser failure: {type(e).__name__}: {e}")
+
+        if cache and cache_key:
+            try:
+                await cache.set_json(cache_key, parsed.model_dump())  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        return parsed
+    except HTTPException:
+        raise
+    except Exception as e:  # broad catch to avoid opaque 500s
+        import traceback
+        tb = traceback.format_exc(limit=6)
+        logging.error("/header/iq fatal error: %s", e)
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=500, content={"error": str(e), "type": type(e).__name__, "trace": tb})
     finally:
         if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 
 @router.post("/header/read_binary")
-async def read_binary(file: UploadFile = File(None), path: str = Form(None)):
+async def read_binary(request: Request, file: UploadFile = File(None), path: str = Form(None)):
     """Read minimal binary header fields using segyio if available.
     Accepts either an uploaded file or a filesystem path.
     Returns: { sample_interval_us, samples_per_trace, format_code }
     """
     tmp_path = None
     try:
+        if not file and not path:
+            # Attempt to parse JSON body for {"path": "..."}
+            try:
+                payload = await request.json()
+                if isinstance(payload, dict):
+                    path = payload.get("path")  # type: ignore
+            except Exception:
+                pass
         if file:
             with tempfile.NamedTemporaryFile(delete=False) as tmp:
                 content = await file.read()
@@ -324,7 +424,7 @@ def get_llm_provider(request: Request) -> LLMProvider:
 
 
 @router.post("/header/parse", response_model=ParseResponse)
-async def parse_header(req: ParseRequest, provider: LLMProvider = Depends(get_llm_provider)) -> ParseResponse:
+async def parse_header(req: ParseRequest, request: Request, provider: LLMProvider = Depends(get_llm_provider)) -> ParseResponse:
     """Phase-3 parser: combine baseline regex with optional LLM fallback and return provenance.
 
     Body schema:
@@ -335,20 +435,38 @@ async def parse_header(req: ParseRequest, provider: LLMProvider = Depends(get_ll
     """
     lines = req.lines  # already normalized to exactly 40 via validator
 
+    cache = getattr(request.app.state, "cache", None)
+    cache_key = None
+    if cache:
+        cache_key = f"parse:{int(req.use_llm)}:{_hash_lines(lines)}"
+        cached = await cache.get_json(cache_key)
+        if cached:
+            try:
+                header_payload = cached.get("header") if isinstance(cached, dict) else None
+                prov_payload = cached.get("provenance") if isinstance(cached, dict) else None
+                if header_payload is not None:
+                    hj = HeaderJSON(**header_payload)
+                    provenance = [ProvenanceEntry(**p) for p in (prov_payload or [])]
+                    return ParseResponse(header=hj, provenance=provenance)
+            except Exception:
+                pass
+
     # 1) Baseline
     base = parse_baseline(lines)
-
     # 2) LLM fallback (pluggable)
     llm_fields = run_llm(lines, provider) if req.use_llm and provider else {}
-
     # 3) Merge
     merged_fields, prov = merge_with_confidence(base, llm_fields)
-
     # 4) Project into HeaderJSON (filter to schema fields)
     hj = HeaderJSON(**{k: fe for k, fe in merged_fields.items() if k in HeaderJSON.model_fields})
-
     provenance = [ProvenanceEntry(**p) for p in prov]
-    return ParseResponse(header=hj, provenance=provenance)
+    resp = ParseResponse(header=hj, provenance=provenance)
+    if cache and cache_key:
+        try:
+            await cache.set_json(cache_key, resp.model_dump())  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    return resp
 
 
 class CRSSolveRequest(BaseModel):

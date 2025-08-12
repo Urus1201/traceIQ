@@ -31,7 +31,13 @@ def _validate_contractor_candidate(value: str, line_no: int) -> bool:
         return False
     # Prefer org-shaped tokens or tail lines (C35–C40)
     tail_ok = line_no >= 35
-    return bool(ORG_RX.search(v) or tail_ok)
+    if ORG_RX.search(v) or tail_ok:
+        return True
+    # Heuristic: allow two-word uppercase names early (e.g., ACME GEO)
+    parts = [p for p in re.split(r"[^A-Z0-9]+", v.upper()) if p]
+    if len(parts) >= 2 and all(len(p) >= 3 for p in parts[:2]):
+        return True
+    return False
 
 def _get_llm_provider():
     try:
